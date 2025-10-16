@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>เว็บตรวจลอตเตอรี่</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>เว็บตรวจลอตเตอรี่</h1>
+
+    <label for="lottoDate">เลือกงวด:</label>
+    <select id="lottoDate">
+      <option value="">-- กรุณาเลือกงวด --</option>
+    </select>
+
+    <div class="check-section">
+      <input id="lottoNumber" maxlength="6" placeholder="กรอกเลข 6 หลัก" />
+      <button id="checkBtn">ตรวจรางวัล</button>
+    </div>
+
+    <div id="result"></div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

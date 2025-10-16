@@ -1,0 +1,49 @@
+body {
+  font-family: "Prompt", sans-serif;
+  background-color: #f7f8fa;
+  color: #333;
+  text-align: center;
+  padding: 40px;
+}
+
+.container {
+  background: #fff;
+  border-radius: 10px;
+  padding: 30px;
+  max-width: 500px;
+  margin: auto;
+  box-shadow: 0 0 10px rgba(0,0,0,0.1);
+}
+
+select, input, button {
+  padding: 10px;
+  font-size: 16px;
+  margin-top: 10px;
+}
+
+.check-section {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+input {
+  width: 150px;
+  text-align: center;
+}
+
+#result {
+  margin-top: 20px;
+  text-align: left;
+}
+
+.result-win {
+  color: green;
+  font-weight: bold;
+}
+
+.result-lose {
+  color: red;
+  font-weight: bold;
+}
