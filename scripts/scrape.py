@@ -3,6 +3,8 @@ from bs4 import BeautifulSoup
 import json
 import os
 import re
+import sys
+import time
 
 SANOOK_BASE = 'https://news.sanook.com/lotto'
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
@@ -11,6 +13,8 @@ HEADERS = {
     'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Referer': 'https://news.sanook.com/',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
 }
 
 THAI_MONTHS = {
@@ -21,6 +25,39 @@ THAI_MONTHS = {
 }
 THAI_MONTHS_REV = {v: k for k, v in THAI_MONTHS.items()}
 
+# ผลรางวัลที่ต้องมีครบทุกช่อง ถ้าขาดแปลว่าหวยยังออกไม่ครบ → ยังไม่บันทึก
+# digits/count/reward เป็นค่าตั้งต้น ส่วนค่าจริงอ่านจากหัวข้อบนหน้าเว็บอีกที
+SPEC = {
+    'prizeFirst':               {'digits': 6, 'count': 1,   'reward': '6000000', 'name': 'รางวัลที่ 1'},
+    'prizeFirstNear':           {'digits': 6, 'count': 2,   'reward': '100000',  'name': 'รางวัลข้างเคียงรางวัลที่ 1'},
+    'prizeSecond':              {'digits': 6, 'count': 5,   'reward': '200000',  'name': 'รางวัลที่ 2'},
+    'prizeThird':               {'digits': 6, 'count': 10,  'reward': '80000',   'name': 'รางวัลที่ 3'},
+    'prizeFourth':              {'digits': 6, 'count': 50,  'reward': '40000',   'name': 'รางวัลที่ 4'},
+    'prizeFifth':               {'digits': 6, 'count': 100, 'reward': '20000',   'name': 'รางวัลที่ 5'},
+    'runningNumberFrontThree':  {'digits': 3, 'count': 2,   'reward': '4000',    'name': 'รางวัลเลขหน้า 3 ตัว'},
+    'runningNumberBackThree':   {'digits': 3, 'count': 2,   'reward': '4000',    'name': 'รางวัลเลขท้าย 3 ตัว'},
+    'runningNumberBackTwo':     {'digits': 2, 'count': 1,   'reward': '2000',    'name': 'รางวัลเลขท้าย 2 ตัว'},
+}
+
+PRIZE_ORDER = ['prizeFirst', 'prizeFirstNear', 'prizeSecond',
+               'prizeThird', 'prizeFourth', 'prizeFifth']
+RUNNING_ORDER = ['runningNumberFrontThree', 'runningNumberBackThree',
+                 'runningNumberBackTwo']
+
+# ป้ายกำกับบนหน้า sanook → id ของเรา (เทียบแบบตัดช่องว่างออก)
+# เรียงจากเจาะจงมากไปน้อย เพราะ 'ข้างเคียงรางวัลที่1' มีคำว่า 'รางวัลที่1' อยู่ด้วย
+LABEL_MAP = [
+    ('ข้างเคียงรางวัลที่1', 'prizeFirstNear'),
+    ('เลขหน้า3ตัว',        'runningNumberFrontThree'),
+    ('เลขท้าย3ตัว',        'runningNumberBackThree'),
+    ('เลขท้าย2ตัว',        'runningNumberBackTwo'),
+    ('รางวัลที่1',         'prizeFirst'),
+    ('รางวัลที่2',         'prizeSecond'),
+    ('รางวัลที่3',         'prizeThird'),
+    ('รางวัลที่4',         'prizeFourth'),
+    ('รางวัลที่5',         'prizeFifth'),
+]
+
 
 def id_to_thai_date(id: str) -> str:
     day = int(id[0:2])
@@ -29,15 +66,133 @@ def id_to_thai_date(id: str) -> str:
     return f'{day} {THAI_MONTHS_REV.get(month, month)} {year}'
 
 
-def fetch_page(url: str) -> BeautifulSoup:
+def id_sort_key(draw_id: str) -> tuple:
+    """เรียงงวดจากใหม่ไปเก่าโดยดูจาก id (DDMMYYYY พ.ศ.) ไม่พึ่งลำดับบนหน้าเว็บ"""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        r.encoding = 'utf-8'
-        return BeautifulSoup(r.text, 'lxml')
-    except Exception as e:
-        print(f'  ❌ fetch failed {url}: {e}')
-        return None
+        return (int(draw_id[4:8]), int(draw_id[2:4]), int(draw_id[0:2]))
+    except ValueError:
+        return (0, 0, 0)
+
+
+def fetch_page(url: str, attempts: int = 3) -> BeautifulSoup:
+    for i in range(attempts):
+        try:
+            # ใส่ query กัน cache ของ CDN ไม่ให้ส่งหน้าเก่าที่ผลยังไม่ออกกลับมา
+            r = requests.get(url, headers=HEADERS, timeout=20,
+                             params={'_': int(time.time())})
+            r.raise_for_status()
+            r.encoding = 'utf-8'
+            return BeautifulSoup(r.text, 'lxml')
+        except Exception as e:
+            print(f'  ⚠️  fetch failed ({i + 1}/{attempts}) {url}: {e}')
+            if i + 1 < attempts:
+                time.sleep(2 * (i + 1))
+    print(f'  ❌ fetch failed {url}')
+    return None
+
+
+def label_to_id(label_text: str) -> str:
+    """แปลงหัวข้อรางวัลเป็น id — ตัดช่องว่างออกก่อนเทียบ กัน sanook เปลี่ยนการเว้นวรรค"""
+    flat = re.sub(r'\s+', '', label_text)
+    for needle, pid in LABEL_MAP:
+        if needle in flat:
+            return pid
+    return None
+
+
+def official_count(label_text: str, default: int) -> int:
+    """อ่านจำนวนรางวัลจากหัวข้อจริง เช่น 'มี 50 รางวัลๆละ 40,000 บาท' → 50"""
+    m = re.search(r'(\d+)\s*รางวัลๆ', label_text)
+    return int(m.group(1)) if m else default
+
+
+def official_reward(label_text: str, default: str) -> str:
+    """อ่านเงินรางวัลจากหัวข้อจริง เช่น 'รางวัลละ 6,000,000 บาท' → '6000000'"""
+    m = re.search(r'ละ\s*([\d,]+)\s*บาท', label_text)
+    return m.group(1).replace(',', '') if m else default
+
+
+def collect_blocks(soup: BeautifulSoup) -> dict:
+    """
+    ดึงเลขจาก DOM จริง ไม่ใช่การ scan ข้อความทั้งหน้า
+    โครงสร้าง sanook: หัวข้อ p.title__reward กับเลข .lotto__number อยู่ในกล่องเดียวกัน
+    ผูกหัวข้อกับเลขแบบนี้ทำให้ไม่หลุดไปหยิบเลขของรางวัลอื่น หรือหยิบจำนวนเงิน
+    (เช่น '4,000 บาท' ที่เคยกลายเป็นเลข 000)
+    """
+    found = {}
+    for label_el in soup.select('p.title__reward'):
+        block = label_el.parent
+        if block is None:
+            continue
+        label_text = label_el.get_text(' ', strip=True)
+        pid = label_to_id(label_text)
+        if not pid or pid in found:
+            continue
+
+        digits = SPEC[pid]['digits']
+        raw = [el.get_text(strip=True) for el in block.select('.lotto__number')]
+        # รับเฉพาะเลขที่จำนวนหลักถูกต้อง → 'xxx' / 'xxxxxx' ตอนหวยยังไม่ออกถูกตัดทิ้ง
+        nums = [t for t in raw if re.fullmatch(r'\d{%d}' % digits, t)]
+
+        found[pid] = {
+            'numbers': nums,
+            'placeholders': len(raw) - len(nums),
+            'count': official_count(label_text, SPEC[pid]['count']),
+            'reward': official_reward(label_text, SPEC[pid]['reward']),
+        }
+    return found
+
+
+def parse_lotto_page(soup: BeautifulSoup, draw_id: str):
+    """คืน (data, problems) — ถ้า problems ไม่ว่างแปลว่าผลยังไม่ครบ ห้ามบันทึก"""
+    date_el = soup.find(['h1', 'h2'], string=re.compile(r'\d{4}'))
+    date_text = date_el.get_text(strip=True) if date_el else id_to_thai_date(draw_id)
+
+    found = collect_blocks(soup)
+    problems = []
+
+    for pid in PRIZE_ORDER + RUNNING_ORDER:
+        blk = found.get(pid)
+        if blk is None:
+            problems.append(f'{pid}: ไม่พบหัวข้อบนหน้าเว็บ')
+        elif blk['placeholders'] and not blk['numbers']:
+            problems.append(f'{pid}: ยังเป็น xxx (ยังไม่ออกรางวัล)')
+        elif len(blk['numbers']) != blk['count']:
+            problems.append(
+                f'{pid}: ได้ {len(blk["numbers"])} เลข แต่ต้องมี {blk["count"]}')
+
+    if problems:
+        return None, problems
+
+    def block(pid):
+        return {'id': pid, 'name': SPEC[pid]['name'], 'reward': found[pid]['reward'],
+                'amount': found[pid]['count'], 'number': found[pid]['numbers']}
+
+    return {'date': date_text, 'endpoint': f'{SANOOK_BASE}/check/{draw_id}/',
+            'prizes': [block(pid) for pid in PRIZE_ORDER],
+            'runningNumbers': [block(pid) for pid in RUNNING_ORDER]}, []
+
+
+def is_valid_file(path: str) -> bool:
+    """ไฟล์เดิมข้อมูลครบถูกต้องไหม — ถ้าไม่ครบจะ scrape ซ้ำให้เอง"""
+    try:
+        with open(path, encoding='utf-8') as f:
+            res = json.load(f)['response']
+    except Exception:
+        return False
+
+    blocks = {b['id']: b for b in res.get('prizes', []) + res.get('runningNumbers', [])}
+    for pid, spec in SPEC.items():
+        blk = blocks.get(pid)
+        if not blk:
+            return False
+        nums = blk.get('number', [])
+        if len(nums) != spec['count']:
+            return False
+        if not all(isinstance(n, str) and re.fullmatch(r'\d{%d}' % spec['digits'], n)
+                   for n in nums):
+            return False
+    return True
 
 
 def get_draw_list() -> list:
@@ -53,120 +208,71 @@ def get_draw_list() -> list:
         if m and m.group(1) not in seen:
             draw_id = m.group(1)
             seen.add(draw_id)
-            date_text = a.get_text(strip=True) or id_to_thai_date(draw_id)
-            results.append({'id': draw_id, 'date': date_text})
+            results.append({'id': draw_id, 'date': id_to_thai_date(draw_id)})
 
     print(f'  found {len(results)} draws on sanook')
     return results
 
 
-def parse_lotto_page(soup: BeautifulSoup, draw_id: str) -> dict:
-    prizes = []
-    running_numbers = []
-
-    date_el = soup.find(['h1', 'h2'], string=re.compile(r'\d{4}'))
-    date_text = date_el.get_text(strip=True) if date_el else id_to_thai_date(draw_id)
-
-    full_text = soup.get_text()
-
-    def find_numbers(label_patterns, length):
-        pattern = r'\b\d{' + str(length) + r'}\b'
-        for label in label_patterns:
-            idx = full_text.find(label)
-            if idx == -1:
-                continue
-            chunk = full_text[idx:idx + 300]
-            nums = re.findall(pattern, chunk)
-            if nums:
-                return list(dict.fromkeys(nums))
-        return []
-
-    n = find_numbers(['รางวัลที่ 1', 'รางวัลที่1'], 6)
-    if n:
-        prizes.append({'id': 'prizeFirst', 'name': 'รางวัลที่ 1',
-                        'reward': '6000000', 'amount': 1, 'number': n[:1]})
-
-    n = find_numbers(['ข้างเคียงรางวัลที่ 1', 'รางวัลข้างเคียง'], 6)
-    if n:
-        prizes.append({'id': 'prizeFirstNear', 'name': 'รางวัลข้างเคียงรางวัลที่ 1',
-                        'reward': '100000', 'amount': 2, 'number': n[:2]})
-
-    for pid, pname, reward, max_count in [
-        ('prizeSecond', 'รางวัลที่ 2', '200000', 5),
-        ('prizeThird',  'รางวัลที่ 3', '80000',  10),
-        ('prizeFourth', 'รางวัลที่ 4', '40000',  50),
-        ('prizeFifth',  'รางวัลที่ 5', '20000',  100),
-    ]:
-        n = find_numbers([pname, pname.replace(' ', '')], 6)
-        if n:
-            prizes.append({'id': pid, 'name': pname, 'reward': reward,
-                            'amount': len(n), 'number': n[:max_count]})
-
-    n = find_numbers(['เลขหน้า 3 ตัว', 'เลขหน้า3ตัว'], 3)
-    if n:
-        running_numbers.append({'id': 'runningNumberFrontThree', 'name': 'รางวัลเลขหน้า 3 ตัว',
-                                  'reward': '4000', 'amount': len(n), 'number': n[:2]})
-
-    n = find_numbers(['เลขท้าย 3 ตัว', 'เลขท้าย3ตัว'], 3)
-    if n:
-        running_numbers.append({'id': 'runningNumberBackThree', 'name': 'รางวัลเลขท้าย 3 ตัว',
-                                  'reward': '4000', 'amount': len(n), 'number': n[:2]})
-
-    n = find_numbers(['เลขท้าย 2 ตัว', 'เลขท้าย2ตัว'], 2)
-    if n:
-        running_numbers.append({'id': 'runningNumberBackTwo', 'name': 'รางวัลเลขท้าย 2 ตัว',
-                                  'reward': '2000', 'amount': len(n), 'number': n[:1]})
-
-    if not prizes:
-        print(f'  ⚠️  could not parse prizes for {draw_id}')
-        return None
-
-    return {'date': date_text, 'endpoint': f'{SANOOK_BASE}/check/{draw_id}/',
-            'prizes': prizes, 'runningNumbers': running_numbers}
-
-
-def scrape_draw(draw_id: str) -> dict:
+def scrape_draw(draw_id: str):
     url = f'{SANOOK_BASE}/check/{draw_id}/'
     print(f'  🔍 scraping {url}')
     soup = fetch_page(url)
     if not soup:
-        return None
+        return None, ['โหลดหน้าเว็บไม่สำเร็จ']
     return parse_lotto_page(soup, draw_id)
 
 
 def main():
+    repair = '--repair' in sys.argv
     os.makedirs(DATA_DIR, exist_ok=True)
 
     draw_list = get_draw_list()
 
-    # ตรวจว่างวดไหนที่ยังไม่มีไฟล์ → scrape เฉพาะงวดใหม่
-    new_draws = []
+    # รวมงวดที่เคยเก็บไว้แล้วด้วย เผื่อหน้าแรกของ sanook ลิสต์มาไม่ครบ
+    known = {d['id'] for d in draw_list}
+    for fn in os.listdir(DATA_DIR):
+        m = re.fullmatch(r'(\d{8})\.json', fn)
+        if m and m.group(1) not in known:
+            known.add(m.group(1))
+            draw_list.append({'id': m.group(1), 'date': id_to_thai_date(m.group(1))})
+
+    draw_list.sort(key=lambda d: id_sort_key(d['id']), reverse=True)
+
+    # scrape งวดที่ยังไม่มีไฟล์ หรือไฟล์เดิมข้อมูลไม่ครบ
+    # (งวดที่เคย scrape ตอนหวยออกไม่ครบจะถูกเก็บใหม่ให้อัตโนมัติ)
+    todo = []
     for draw in draw_list:
         out_path = os.path.join(DATA_DIR, f'{draw["id"]}.json')
-        if not os.path.exists(out_path):
-            new_draws.append(draw)
+        if repair or not os.path.exists(out_path) or not is_valid_file(out_path):
+            todo.append(draw)
 
-    if not new_draws:
-        print('✅ ไม่มีงวดใหม่ ไม่ต้อง scrape')
+    if not todo:
+        print('✅ ข้อมูลครบทุกงวดแล้ว ไม่ต้อง scrape')
     else:
-        print(f'🆕 พบ {len(new_draws)} งวดใหม่ กำลัง scrape...')
-        for draw in new_draws:
-            data = scrape_draw(draw['id'])
+        print(f'🆕 ต้อง scrape {len(todo)} งวด...')
+        for draw in todo:
+            data, problems = scrape_draw(draw['id'])
             if data:
                 out_path = os.path.join(DATA_DIR, f'{draw["id"]}.json')
                 with open(out_path, 'w', encoding='utf-8') as f:
                     json.dump({'status': 'success', 'response': data}, f,
                               ensure_ascii=False, indent=2)
                 print(f'  💾 saved {draw["id"]}.json')
+            else:
+                # ไม่เขียนทับไฟล์เดิม ปล่อยให้ cron รอบถัดไปมาเก็บใหม่
+                print(f'  ⏳ ข้าม {draw["id"]} (ผลยังไม่ครบ): {"; ".join(problems[:3])}')
+            time.sleep(1)
 
-    # อัปเดต list.json เสมอ (เผื่อมีงวดใหม่)
+    # list.json เก็บเฉพาะงวดที่ข้อมูลครบจริง
     available = []
     for draw in draw_list:
-        if os.path.exists(os.path.join(DATA_DIR, f'{draw["id"]}.json')):
+        path = os.path.join(DATA_DIR, f'{draw["id"]}.json')
+        if os.path.exists(path) and is_valid_file(path):
             available.append({
                 'id': draw['id'],
                 'url': f'/data/{draw["id"]}.json',
-                'date': draw['date']
+                'date': draw['date'],
             })
 
     with open(os.path.join(DATA_DIR, 'list.json'), 'w', encoding='utf-8') as f:
@@ -174,16 +280,14 @@ def main():
                   ensure_ascii=False, indent=2)
     print(f'✅ list.json updated with {len(available)} draws')
 
-    # latest.json → งวดล่าสุด
+    # latest.json → งวดล่าสุดที่ข้อมูลครบ
     if available:
         latest_id = available[0]['id']
-        latest_src = os.path.join(DATA_DIR, f'{latest_id}.json')
-        if os.path.exists(latest_src):
-            with open(latest_src, encoding='utf-8') as f:
-                latest_data = json.load(f)
-            with open(os.path.join(DATA_DIR, 'latest.json'), 'w', encoding='utf-8') as f:
-                json.dump(latest_data, f, ensure_ascii=False, indent=2)
-            print(f'✅ latest.json → {latest_id}')
+        with open(os.path.join(DATA_DIR, f'{latest_id}.json'), encoding='utf-8') as f:
+            latest_data = json.load(f)
+        with open(os.path.join(DATA_DIR, 'latest.json'), 'w', encoding='utf-8') as f:
+            json.dump(latest_data, f, ensure_ascii=False, indent=2)
+        print(f'✅ latest.json → {latest_id}')
 
 
 if __name__ == '__main__':
